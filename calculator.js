@@ -1,17 +1,20 @@
 // ==UserScript==
-// @name         币安多合约计算器 (稳定调试版)
+// @name         币安多合约计算器 (记忆版)
 // @namespace    https://binance.com
-// @version      1.3
-// @description  定义变量（现货/合约，最新价/买一/卖一），输入四则运算表达式，实时计算结果，显示详细错误
+// @version      1.4
+// @description  支持变量定义、表达式计算，自动保存/恢复设置，实时获取币安价格（无eval，CSP安全）
 // @author       Custom
 // @match        *://*.binance.com/*
-// @match        *://*
 // @grant        GM_addStyle
 // @run-at       document-end
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    // ==================== 存储键名 ====================
+    const STORAGE_VARS = 'binance_calc_variables';
+    const STORAGE_EXPR = 'binance_calc_expression';
 
     // ==================== 样式 ====================
     GM_addStyle(`
@@ -130,10 +133,93 @@
             word-break: break-all;
         }
         .result-label { font-size: 11px; color: #9ca3af; margin-right: 6px; }
-        .error { color: #ef4444; }
+        .error-msg {
+            color: #ef4444;
+            font-size: 11px;
+            margin-top: 4px;
+            text-align: right;
+        }
     `);
 
-    // ==================== 全局变量 ====================
+    // ==================== 安全的表达式解析器 ====================
+    function safeEval(expr, variables) {
+        let replaced = expr;
+        for (const [name, value] of Object.entries(variables)) {
+            const regex = new RegExp(`\\b${name}\\b`, 'g');
+            replaced = replaced.replace(regex, value);
+        }
+        if (!/^[\d+\-*/()\s.]+$/.test(replaced)) {
+            return { error: '表达式包含非法字符或未定义变量' };
+        }
+        try {
+            const result = parseExpression(replaced);
+            if (isNaN(result) || !isFinite(result)) {
+                return { error: '无效表达式' };
+            }
+            return { value: result };
+        } catch (e) {
+            return { error: '表达式语法错误: ' + e.message };
+        }
+    }
+
+    function parseExpression(str) {
+        let pos = 0;
+        const s = str.replace(/\s/g, '');
+        function peek() { return s[pos]; }
+        function consume(ch) {
+            if (peek() === ch) {
+                pos++;
+                return true;
+            }
+            return false;
+        }
+        function parsePrimary() {
+            if (consume('(')) {
+                const expr = parseExpression();
+                if (!consume(')')) throw new Error('缺少右括号');
+                return expr;
+            }
+            let start = pos;
+            while (pos < s.length && (s[pos] >= '0' && s[pos] <= '9' || s[pos] === '.')) pos++;
+            if (start === pos) throw new Error('期望数字或括号');
+            const num = parseFloat(s.substring(start, pos));
+            if (isNaN(num)) throw new Error('无效数字');
+            return num;
+        }
+        function parseTerm() {
+            let left = parsePrimary();
+            while (true) {
+                if (consume('*')) {
+                    left *= parsePrimary();
+                } else if (consume('/')) {
+                    const divisor = parsePrimary();
+                    if (divisor === 0) throw new Error('除零错误');
+                    left /= divisor;
+                } else {
+                    break;
+                }
+            }
+            return left;
+        }
+        function parseExpression() {
+            let left = parseTerm();
+            while (true) {
+                if (consume('+')) {
+                    left += parseTerm();
+                } else if (consume('-')) {
+                    left -= parseTerm();
+                } else {
+                    break;
+                }
+            }
+            return left;
+        }
+        const result = parseExpression();
+        if (pos < s.length) throw new Error('多余字符');
+        return result;
+    }
+
+    // ==================== WebSocket 部分 ====================
     let variables = [];
     let currentPrices = {};
     let wsConnections = {};
@@ -142,7 +228,6 @@
         return market === 'spot' ? 'wss://stream.binance.com/ws/' : 'wss://fstream.binance.com/ws/';
     }
 
-    // 订阅单个变量
     function subscribeVariable(varObj) {
         const key = varObj.name;
         if (wsConnections[key]) {
@@ -160,10 +245,7 @@
         const wsUrl = `${getWsBase(varObj.market)}${streamName}`;
         const ws = new WebSocket(wsUrl);
 
-        ws.onopen = () => {
-            // 不输出控制台
-        };
-
+        ws.onopen = () => {};
         ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
@@ -180,15 +262,9 @@
                     updateVariableDisplay(varObj.name, price);
                     updateResult();
                 }
-            } catch(e) {
-                // 静默忽略解析错误
-            }
+            } catch(e) {}
         };
-
-        ws.onerror = () => {
-            // 静默
-        };
-
+        ws.onerror = () => {};
         ws.onclose = () => {
             setTimeout(() => {
                 if (variables.some(v => v.name === varObj.name)) {
@@ -196,7 +272,6 @@
                 }
             }, 3000);
         };
-
         wsConnections[key] = ws;
     }
 
@@ -212,6 +287,48 @@
         }
     }
 
+    // 保存变量到 localStorage
+    function saveVariables() {
+        const toStore = variables.map(v => ({
+            name: v.name,
+            market: v.market,
+            symbol: v.symbol,
+            priceType: v.priceType
+        }));
+        localStorage.setItem(STORAGE_VARS, JSON.stringify(toStore));
+    }
+
+    // 保存表达式
+    function saveExpression(expr) {
+        localStorage.setItem(STORAGE_EXPR, expr);
+    }
+
+    // 加载变量
+    function loadVariables() {
+        const stored = localStorage.getItem(STORAGE_VARS);
+        if (stored) {
+            try {
+                const loaded = JSON.parse(stored);
+                variables = loaded.map(v => ({
+                    name: v.name,
+                    market: v.market,
+                    symbol: v.symbol,
+                    priceType: v.priceType
+                }));
+                // 重新订阅每个变量
+                variables.forEach(v => subscribeVariable(v));
+                renderVariableList();
+                return true;
+            } catch(e) {}
+        }
+        return false;
+    }
+
+    // 加载表达式
+    function loadExpression() {
+        return localStorage.getItem(STORAGE_EXPR) || '';
+    }
+
     function addVariable(name, market, symbol, priceType) {
         if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
             alert('变量名只能包含字母、数字、下划线，且不能以数字开头');
@@ -225,6 +342,8 @@
         variables.push(newVar);
         subscribeVariable(newVar);
         renderVariableList();
+        saveVariables();          // 保存变量
+        updateResult();           // 重新计算结果（因为变量变了）
         return true;
     }
 
@@ -236,6 +355,7 @@
         }
         delete currentPrices[name];
         renderVariableList();
+        saveVariables();          // 保存变量
         updateResult();
     }
 
@@ -269,66 +389,44 @@
         });
     }
 
-    // 计算表达式，返回结果或错误信息
-    function evaluateExpression(expr) {
-        // 检查未定义的变量
-        const variableNames = variables.map(v => v.name);
-        const regexVar = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
-        let match;
-        const usedVars = new Set();
-        while ((match = regexVar.exec(expr)) !== null) {
-            const varName = match[1];
-            // 排除数学函数或常量（如 NaN, Infinity, undefined 等）
-            if (!['NaN', 'Infinity', 'undefined', 'null', 'true', 'false'].includes(varName)) {
-                usedVars.add(varName);
-            }
-        }
-        for (let usedVar of usedVars) {
-            if (!variableNames.includes(usedVar)) {
-                return { error: `变量 "${usedVar}" 未定义` };
-            }
-        }
-
-        let replacedExpr = expr;
-        for (const v of variables) {
-            const price = currentPrices[v.name];
-            if (price !== undefined && !isNaN(price)) {
-                const regex = new RegExp(`\\b${v.name}\\b`, 'g');
-                replacedExpr = replacedExpr.replace(regex, price);
-            } else {
-                // 变量有定义但尚未收到价格，返回等待价格
-                return { error: `变量 "${v.name}" 等待价格数据` };
-            }
-        }
-
-        try {
-            const result = new Function('return (' + replacedExpr + ')')();
-            if (isNaN(result) || !isFinite(result)) {
-                return { error: '计算结果无效（可能除零或无穷大）' };
-            }
-            return { result };
-        } catch(e) {
-            return { error: `表达式语法错误: ${e.message}` };
-        }
-    }
-
     function updateResult() {
         const exprInput = document.querySelector('#calc-expr');
         const resultSpan = document.querySelector('#calc-result');
+        const errorSpan = document.querySelector('#calc-error');
         if (!exprInput || !resultSpan) return;
+
         const expr = exprInput.value.trim();
+        // 每次输入都保存表达式（实时）
+        saveExpression(expr);
+
         if (expr === '') {
             resultSpan.textContent = '等待输入';
-            resultSpan.classList.remove('error');
+            if (errorSpan) errorSpan.textContent = '';
             return;
         }
-        const evalResult = evaluateExpression(expr);
-        if (evalResult.error) {
-            resultSpan.textContent = evalResult.error;
-            resultSpan.classList.add('error');
+
+        const varValues = {};
+        const undefinedVars = [];
+        for (const v of variables) {
+            if (currentPrices[v.name] !== undefined && !isNaN(currentPrices[v.name])) {
+                varValues[v.name] = currentPrices[v.name];
+            } else {
+                undefinedVars.push(v.name);
+            }
+        }
+        if (undefinedVars.length > 0) {
+            resultSpan.textContent = '--';
+            if (errorSpan) errorSpan.textContent = `变量 ${undefinedVars.join(', ')} 暂无价格数据`;
+            return;
+        }
+
+        const resultObj = safeEval(expr, varValues);
+        if (resultObj.error) {
+            resultSpan.textContent = '--';
+            if (errorSpan) errorSpan.textContent = resultObj.error;
         } else {
-            resultSpan.textContent = evalResult.result.toFixed(8);
-            resultSpan.classList.remove('error');
+            resultSpan.textContent = resultObj.value.toFixed(8);
+            if (errorSpan) errorSpan.textContent = '';
         }
     }
 
@@ -369,6 +467,7 @@
                         <span class="result-label">结果 = </span>
                         <span id="calc-result">等待输入</span>
                     </div>
+                    <div id="calc-error" class="error-msg"></div>
                 </div>
             </div>
         `;
@@ -402,7 +501,7 @@
         document.addEventListener('mouseup', () => isDragging = false);
         document.addEventListener('mouseleave', () => isDragging = false);
 
-        // 关闭按钮
+        // 关闭按钮（不清除存储，下次打开依然恢复）
         panel.querySelector('.calc-close').addEventListener('click', () => {
             Object.values(wsConnections).forEach(ws => ws.close());
             panel.remove();
@@ -428,11 +527,18 @@
         // 表达式输入
         const exprInput = panel.querySelector('#calc-expr');
         exprInput.addEventListener('input', () => updateResult());
-        exprInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') updateResult();
-        });
 
-        renderVariableList();
+        // 先尝试加载存储
+        const hasVars = loadVariables();        // 加载变量并订阅
+        const savedExpr = loadExpression();
+        exprInput.value = savedExpr;
+
+        // 如果没有加载到变量，至少保证变量列表为空
+        if (!hasVars) {
+            renderVariableList();
+        }
+
+        // 初始化结果
         updateResult();
     }
 
